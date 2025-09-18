@@ -1,0 +1,5 @@
+librosa
+requests
+torch
+transformers
+yt_dlp
