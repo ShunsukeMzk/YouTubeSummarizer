@@ -10,6 +10,8 @@ import torch
 import requests
 import re
 import shutil
+import base64
+from pathlib import Path
 from datetime import datetime
 from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
 from yt_dlp import YoutubeDL
@@ -28,9 +30,10 @@ OUTPUT_DIR = "./output"
 STT_DEVICE = "mps" if torch.mps.is_available() else "cpu"
 STT_MODEL_ID = "openai/whisper-large-v3-turbo"  # 文字起こしに使用するモデル
 
-# LM Studio設定
+# LM Studio設定（要約）
 LM_STUDIO_API_URL = "http://localhost:1234/v1/chat/completions"
-LM_STUDIO_MODEL = "openai/gpt-oss-120b"  # 要約に使用するモデル
+LM_STUDIO_SUMMARY_MODEL = "openai/gpt-oss-120b"  # 要約に使用するモデル
+LM_STUDIO_VISION_MODEL = "google/gemma-3-27b"  # サムネイル文字抽出に使用するモデル
 # =====================
 
 
@@ -39,34 +42,35 @@ def ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
 
 
-def get_video_info(url: str) -> dict:
+def clean_output_directory(output_dir: str) -> None:
     """
-    YouTube動画の情報を取得
-    戻り値: 動画情報の辞書
+    outputディレクトリ内のファイルを削除
+    ディレクトリ自体は削除せず、中身のファイルのみを削除
     """
+    if not os.path.exists(output_dir):
+        print(f"[INFO] 出力ディレクトリが存在しません: {output_dir}")
+        return
+
+    print(f"[INFO] 出力ディレクトリをクリーンアップ中: {output_dir}")
+
     try:
-        with YoutubeDL({"quiet": True}) as ydl:
-            info = ydl.extract_info(url, download=False)
-            return {
-                "title": info.get("title", "不明なタイトル"),
-                "uploader": info.get("uploader", "不明なアップローダー"),
-                "upload_date": info.get("upload_date", ""),
-                "duration": info.get("duration", 0),
-                "view_count": info.get("view_count", 0),
-                "description": info.get("description", ""),
-                "url": url,
-            }
+        # ディレクトリ内のファイルとサブディレクトリを取得
+        for item in os.listdir(output_dir):
+            item_path = os.path.join(output_dir, item)
+
+            if os.path.isfile(item_path):
+                # ファイルの場合は削除
+                os.remove(item_path)
+                print(f"[INFO] ファイルを削除: {item}")
+            elif os.path.isdir(item_path):
+                # サブディレクトリの場合は再帰的に削除
+                shutil.rmtree(item_path)
+                print(f"[INFO] ディレクトリを削除: {item}")
+
+        print(f"[INFO] 出力ディレクトリのクリーンアップが完了しました")
+
     except Exception as e:
-        print(f"[WARNING] 動画情報の取得に失敗: {e}")
-        return {
-            "title": "不明なタイトル",
-            "uploader": "不明なアップローダー",
-            "upload_date": "",
-            "duration": 0,
-            "view_count": 0,
-            "description": "",
-            "url": url,
-        }
+        print(f"[WARNING] 出力ディレクトリのクリーンアップ中にエラーが発生: {e}")
 
 
 def format_transcription(text: str) -> str:
@@ -88,97 +92,67 @@ def format_transcription(text: str) -> str:
     return formatted_text
 
 
-def download_audio(url: str, output_dir: str) -> str:
+def download(url: str, output_dir: str):
     """
-    YouTube動画から音声ファイルをダウンロード
-    戻り値: ダウンロードされたファイルのパス
+    YouTube動画から音声ファイルとサムネイルをダウンロード
+    戻り値: (video_info, audio_path, thumbnail_path)
     """
     print(f"[INFO] 音声ダウンロード開始: {url}")
 
     # yt-dlpの設定
     ydl_opts = {
         "format": "bestaudio/best",
-        "outtmpl": os.path.join(output_dir, "audio.%(ext)s"),
+        "outtmpl": os.path.join(output_dir, "downloaded.%(ext)s"),
         "quiet": False,
         "no_warnings": False,
-        "extractaudio": False,  # 音声抽出は後で行う
-        "prefer_ffmpeg": True,
+        "writethumbnail": True,  # サムネイルをダウンロード
+        "postprocessors": [
+            {
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "mp3",
+                "preferredquality": "192",
+            },  # 音声をmp3形式で保存
+            {
+                "key": "FFmpegThumbnailsConvertor",
+                "format": "png",
+                "when": "before_dl",
+            },  # サムネイルをpng形式で保存
+        ],
     }
 
     try:
         with YoutubeDL(ydl_opts) as ydl:
             # 動画情報を取得
-            info = ydl.extract_info(url, download=False)
-            title = info.get("title", "unknown_title")
+            video_info = ydl.extract_info(url, download=False)
+            video_info["url"] = url
+
+            title = video_info.get("title", "unknown_title")
             print(f"[INFO] 動画タイトル: {title}")
 
             # ダウンロード実行
             ydl.download([url])
 
             # ダウンロードされたファイルを探す
-            for filename in os.listdir(output_dir):
-                if filename.startswith("audio.") and not filename.endswith(".mp3"):
-                    return os.path.join(output_dir, filename)
+            audio = Path(output_dir) / "downloaded.mp3"
+            thumbnail = Path(output_dir) / "downloaded.png"
 
-            raise FileNotFoundError("ダウンロードされたファイルが見つかりません")
+            if audio.exists():
+                audio = audio.rename(Path(output_dir) / "audio.mp3")
+            else:
+                raise FileNotFoundError("音声ファイルが見つかりません")
+            if thumbnail.exists():
+                thumbnail = thumbnail.rename(Path(output_dir) / "thumbnail.png")
+            else:
+                print("[WARNING] サムネイルファイルが見つかりません（スキップします）")
+                thumbnail = None
 
-    except DownloadError as e:
-        print(f"[ERROR] ダウンロードに失敗: {e}", file=sys.stderr)
-        sys.exit(1)
+            return video_info, audio, thumbnail
     except Exception as e:
         print(f"[ERROR] 予期しないエラー: {e}", file=sys.stderr)
         sys.exit(1)
 
 
-def convert_to_mp3(input_file: str, output_dir: str) -> str:
-    """
-    音声ファイルをmp3に変換
-    戻り値: 変換されたmp3ファイルのパス
-    """
-    print(f"[INFO] mp3変換開始: {input_file}")
-
-    output_file = os.path.join(output_dir, "audio.mp3")
-
-    try:
-        # ffmpegコマンドを構築
-        cmd = [
-            "ffmpeg",
-            "-i",
-            input_file,
-            "-acodec",
-            "libmp3lame",
-            "-ab",
-            "192k",
-            "-ar",
-            "44100",
-            "-y",  # 既存ファイルを上書き
-            output_file,
-        ]
-
-        # ffmpegを実行
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-
-        print(f"[INFO] mp3変換完了: {output_file}")
-
-        # 元のファイルを削除
-        os.remove(input_file)
-        print(f"[INFO] 元ファイルを削除: {input_file}")
-
-        return output_file
-
-    except subprocess.CalledProcessError as e:
-        print(f"[ERROR] ffmpeg変換に失敗: {e}", file=sys.stderr)
-        print(f"[ERROR] エラー出力: {e.stderr}", file=sys.stderr)
-        sys.exit(1)
-    except FileNotFoundError:
-        print(
-            f"[ERROR] ffmpegが見つかりません。ffmpegをインストールしてください。",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-
-
-def transcribe_audio(mp3_file: str) -> str:
+def transcribe(mp3_file: str) -> str:
     """
     mp3ファイルを一括で文字起こし
     戻り値: 文字起こし結果のテキスト
@@ -250,10 +224,90 @@ def transcribe_audio(mp3_file: str) -> str:
         sys.exit(1)
 
 
-def summarize_with_lm_studio(transcription: str, video_info: dict) -> str:
+def encode_image_as_data_url(path: str) -> str:
+    """画像ファイルを data URL 形式でエンコードして返す"""
+    import mimetypes
+
+    mime, _ = mimetypes.guess_type(path)
+    if not mime:
+        mime = "image/jpeg"  # 拡張子不明なら JPEG として扱う
+    with open(path, "rb") as f:
+        b64 = base64.b64encode(f.read()).decode("utf-8")
+    return f"data:{mime};base64,{b64}"
+
+
+def extract_text_from_thumbnail(thumbnail_path: Path) -> str:
+    """
+    サムネイル画像に含まれるテキストを LM Studio の API（Vision 対応）で抽出する。
+    戻り値: テキスト（抽出できない場合は空文字）
+
+    ※ LM Studio 側が OpenAI 互換の image input を受け付ける前提。
+      - messages[].content に text と image_url を並べる形式を使用
+    """
+    if thumbnail_path is None or not Path(thumbnail_path).exists():
+        return ""
+
+    try:
+        data_url = encode_image_as_data_url(str(thumbnail_path))
+
+        prompt = """画像内のテキストだけを正確に抽出してください。改行も保持し、装飾や絵文字は除去してください。返答はプレーンテキストのみ。
+有効なテキストが抽出できない場合は、「なし」とだけ出力してください。
+"""
+
+        payload = {
+            "model": LM_STUDIO_VISION_MODEL,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": prompt,
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": data_url},
+                        },
+                    ],
+                }
+            ],
+            "temperature": 0.0,
+            "max_tokens": 2048,
+            "stream": False,
+        }
+
+        resp = requests.post(
+            LM_STUDIO_API_URL,
+            json=payload,
+            headers={"Content-Type": "application/json"},
+            timeout=120,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            text = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+            # 後処理：前後空白の削除
+            return text.strip()
+        else:
+            print(f"[WARNING] Vision API エラー: {resp.status_code}\n{resp.text}")
+            return ""
+    except requests.exceptions.RequestException as e:
+        print(f"[WARNING] Vision API リクエスト失敗: {e}")
+        return ""
+    except Exception as e:
+        print(f"[WARNING] Vision テキスト抽出でエラー: {e}")
+        return ""
+
+
+def summarize_with_lm_studio(
+    transcription: str, video_info: dict, thumbnail_text: str = ""
+) -> str:
     """
     LM StudioのAPIを使って文字起こし結果をマークダウン形式でまとめる
     戻り値: マークダウン形式の要約
+
+    追加要件:
+      - タイトルに書かれている内容についての要約を追記
+      - サムネイルにテキストがある場合: その内容についての要約を追記
     """
     print("[INFO] LM Studioで要約を生成中...")
 
@@ -267,15 +321,52 @@ def summarize_with_lm_studio(transcription: str, video_info: dict) -> str:
 4. 読みやすいマークダウン形式にする
 5. 日本語で出力する"""
 
-    user_prompt = f"""以下の動画「{video_info['title']}」の文字起こしテキストを要約してください：
+    base_user_prompt = f"""以下の動画「{video_info['title']}」の文字起こしテキストを要約してください：
 
 {transcription}
+"""
 
-上記の内容をマークダウン形式で要約してください。"""
+    # 追加指示: タイトルとサムネイルに言及
+    title_text = video_info.get("title", "")
+    extra_sections = []
+
+    extra_sections.append(
+        f'- 追加要件: タイトル「{title_text.replace("\n", " ").strip()}.」に関する発言や説明のみを抽出し、その要点を簡潔に要約してください。'
+    )
+
+    if thumbnail_text.strip() and thumbnail_text.strip() != "なし":
+        extra_sections.append(
+            f"- 追加要件: サムネイルのテキスト「{thumbnail_text.replace("\n", " ").strip()}」関する発言や説明のみを抽出し、その要点を簡潔に要約してください。n"
+            + thumbnail_text
+        )
+
+    extra_instructions = "\n".join(
+        [
+            "---",
+            "次の追加要件を満たしてください：",
+            *extra_sections,
+            "---",
+            "出力フォーマット：",
+            "---",
+            "## 概要",
+            "## 主要ポイント (箇条書き)",
+            "## 詳細 (短い段落×数個)",
+            "## タイトルに関する要約",
+            (
+                "## サムネイルに関する要約"
+                if thumbnail_text.strip() and thumbnail_text.strip() != "なし"
+                else ""
+            ),
+            "---",
+            "注意点：マークダウン形式で出力し、見出しは強調しない",
+        ]
+    )
+
+    user_prompt = base_user_prompt + "\n" + extra_instructions
 
     # APIリクエストの構築
     payload = {
-        "model": LM_STUDIO_MODEL,
+        "model": LM_STUDIO_SUMMARY_MODEL,
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
@@ -301,30 +392,38 @@ def summarize_with_lm_studio(transcription: str, video_info: dict) -> str:
 
             # 動画情報とモデル名を要約の先頭に追加
             summary_with_info = (
-                create_summary_header(video_info, LM_STUDIO_MODEL) + summary
+                create_summary_header(
+                    video_info, LM_STUDIO_SUMMARY_MODEL, thumbnail_text
+                )
+                + summary
             )
             return summary_with_info
         else:
-            print(f"[WARNING] LM Studio APIエラー: {response.status_code}")
-            print(f"[WARNING] エラー内容: {response.text}")
-            return create_fallback_summary(transcription, video_info)
+            print(
+                f"[ERROR] LM Studio APIエラー: {response.status_code}", file=sys.stderr
+            )
+            print(f"[ERROR] エラー内容: {response.text}", file=sys.stderr)
+            sys.exit(1)
 
     except requests.exceptions.ConnectionError:
         print(
-            "[WARNING] LM Studioに接続できません。ローカルでLM Studioが起動しているか確認してください。"
+            "[ERROR] LM Studioに接続できません。ローカルでLM Studioが起動しているか確認してください。",
+            file=sys.stderr,
         )
-        return create_fallback_summary(transcription, video_info)
+        sys.exit(1)
     except requests.exceptions.Timeout:
-        print("[WARNING] LM Studio APIのタイムアウトが発生しました。")
-        return create_fallback_summary(transcription, video_info)
+        print("[ERROR] LM Studio APIのタイムアウトが発生しました。", file=sys.stderr)
+        sys.exit(1)
     except Exception as e:
-        print(f"[WARNING] LM Studio APIでエラーが発生しました: {e}")
-        return create_fallback_summary(transcription, video_info)
+        print(f"[ERROR] LM Studio APIでエラーが発生しました: {e}", file=sys.stderr)
+        sys.exit(1)
 
 
-def create_summary_header(video_info: dict, model_name: str) -> str:
+def create_summary_header(
+    video_info: dict, model_name: str, thumbnail_text: str = ""
+) -> str:
     """
-    要約のヘッダー部分を作成（動画情報、使用モデル、要約日時を含む）
+    要約のヘッダー部分を作成（動画情報、使用モデル、要約日時、抽出サムネイル文字を含む）
     戻り値: マークダウン形式のヘッダー
     """
     # 現在の日時を取得
@@ -362,11 +461,12 @@ def create_summary_header(video_info: dict, model_name: str) -> str:
         view_str = "不明"
 
     header = f"""# {video_info['title']} - 要約
+<img src="./thumbnail.png" width="480">
 
 ## 動画情報
 
 - **タイトル**: {video_info['title']}
-- **アップローダー**: {video_info['uploader']}
+- **アップローダー**: {video_info.get('uploader', '不明')}
 - **アップロード日時**: {formatted_upload_date}
 - **動画の長さ**: {duration_str}
 - **再生回数**: {view_str}
@@ -375,63 +475,17 @@ def create_summary_header(video_info: dict, model_name: str) -> str:
 ## 使用モデル
 
 - **要約生成**: {model_name}
+- **サムネイル文字抽出**: {LM_STUDIO_VISION_MODEL if thumbnail_text.strip() else '実施せず（サムネイル文字なし）'}
 
 ## 要約実施日時
 
 - **要約作成日時**: {current_time}
 
----
+{('## 抽出されたサムネイルのテキスト\n\n' + thumbnail_text + '\n\n') if thumbnail_text.strip() else ''}---
 
 """
 
     return header
-
-
-def create_fallback_summary(transcription: str, video_info: dict) -> str:
-    """
-    LM Studioが使用できない場合のフォールバック要約
-    戻り値: 基本的なマークダウン形式の要約
-    """
-    print("[INFO] フォールバック要約を作成中...")
-
-    # ヘッダーを作成
-    header = create_summary_header(
-        video_info, "フォールバック要約（LM Studio APIが利用できませんでした）"
-    )
-
-    # 基本的な要約を作成
-    lines = transcription.split("\n")
-    summary_lines = [
-        "## 文字起こし結果",
-        "",
-        "### 内容",
-        "",
-    ]
-
-    # 最初の10行程度を要約として使用
-    for i, line in enumerate(lines[:10]):
-        if line.strip():
-            summary_lines.append(f"- {line.strip()}")
-
-    if len(lines) > 10:
-        summary_lines.append("")
-        summary_lines.append(f"... 他 {len(lines) - 10} 行")
-
-    summary_lines.extend(
-        [
-            "",
-            "### 注意",
-            "この要約は自動生成されたものです。詳細は文字起こし結果をご確認ください。",
-            "",
-            "---",
-            "",
-            "## 完全な文字起こし結果",
-            "",
-            transcription,
-        ]
-    )
-
-    return header + "\n".join(summary_lines)
 
 
 def sanitize_filename(filename: str) -> str:
@@ -517,18 +571,28 @@ def main():
     # 出力ディレクトリを作成
     ensure_dir(OUTPUT_DIR)
 
-    # 動画タイトルを保存する変数
-    video_title = "動画"
+    # 出力ディレクトリをクリーンアップ（ダウンロード前）
+    clean_output_directory(OUTPUT_DIR)
 
     try:
-        # 1. 音声ダウンロード
-        audio_file = download_audio(YOUTUBE_URL, OUTPUT_DIR)
+        # 1. 音声 + サムネイル ダウンロード
+        video_info, audio, thumbnail = download(YOUTUBE_URL, OUTPUT_DIR)
 
-        # 2. mp3に変換
-        mp3_file = convert_to_mp3(audio_file, OUTPUT_DIR)
+        # 2. サムネイル文字抽出（新規機能）
+        thumbnail_text = extract_text_from_thumbnail(thumbnail) if thumbnail else ""
+        if thumbnail_text.strip():
+            # 抽出結果を保存
+            thumbnail_text_file = os.path.join(OUTPUT_DIR, "thumbnail.txt")
+            with open(thumbnail_text_file, "w", encoding="utf-8") as f:
+                f.write(thumbnail_text)
+            print(f"[INFO] サムネイル抽出テキストを保存しました: {thumbnail_text_file}")
+        else:
+            print(
+                "[INFO] サムネイルからテキストは検出されませんでした（または抽出に失敗）"
+            )
 
         # 3. 文字起こし
-        transcription = transcribe_audio(mp3_file)
+        transcription = transcribe(audio)
 
         # 4. 結果を標準出力
         print("\n" + "=" * 50)
@@ -537,12 +601,8 @@ def main():
         print(transcription)
         print("=" * 50)
 
-        # 5. 動画情報を取得
-        video_info = get_video_info(YOUTUBE_URL)
-        video_title = video_info["title"]
-
-        # 6. LM Studioで要約を生成
-        summary = summarize_with_lm_studio(transcription, video_info)
+        # 5. LM Studioで要約を生成（タイトル＆サムネイル拡張対応）
+        summary = summarize_with_lm_studio(transcription, video_info, thumbnail_text)
 
         print("\n" + "=" * 50)
         print("要約結果:")
@@ -550,7 +610,7 @@ def main():
         print(summary)
         print("=" * 50)
 
-        # 7. 結果をファイルに保存
+        # 6. 結果をファイルに保存
         # 文字起こし結果
         transcription_file = os.path.join(OUTPUT_DIR, "transcription.txt")
         with open(transcription_file, "w", encoding="utf-8") as f:
@@ -563,9 +623,15 @@ def main():
             f.write(summary)
         print(f"[INFO] 要約結果をマークダウンファイルに保存しました: {summary_file}")
 
-        # 8. ディレクトリ名を動画のタイトルに変更
+        # サムネイルファイルの情報を表示
+        if thumbnail:
+            print(f"[INFO] サムネイルファイル: {thumbnail}")
+        else:
+            print("[INFO] サムネイルのダウンロードに失敗しました")
+
+        # 7. ディレクトリ名を動画のタイトルに変更
         print("\n[INFO] ディレクトリ名を動画のタイトルに変更中...")
-        new_output_dir = rename_directory_to_title(OUTPUT_DIR, video_title)
+        new_output_dir = rename_directory_to_title(OUTPUT_DIR, video_info["title"])
 
         if new_output_dir != OUTPUT_DIR:
             print(f"[INFO] 新しいディレクトリ: {new_output_dir}")

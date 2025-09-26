@@ -1,25 +1,38 @@
 # YouTube Summarizer
 
-YouTube動画の音声を自動で文字起こしし、要約を生成するツールです。
+YouTube動画の音声を自動で文字起こしし、要約を生成するツールです。サムネイル画像からテキストを抽出し、タイトルとサムネイルを考慮した要約を行います。
+
+
+<img src="./dummy.png" width="480">  
+
+「魔法の言葉」だけ知りたいときに最適
 
 ## ツールの説明
 
 このツールは以下の処理を自動で実行します：
 
-1. **YouTube URL から音声ファイルをダウンロード**
-   - yt-dlpを使用してYouTube動画から音声を抽出・ダウンロード
+1. **YouTube URL から音声ファイルとサムネイルをダウンロード**
+   - yt-dlpを使用してYouTube動画から音声とサムネイル画像を抽出・ダウンロード
+   - 音声はmp3形式（192kbps）で保存
+   - サムネイルはPNG形式で保存
 
-2. **音声ファイルを ffmpeg で音声ファイルを mp3 に変換**
-   - ダウンロードした音声ファイルをffmpegでmp3形式に変換
-   - 品質設定: 192kbps, 44.1kHz
+2. **サムネイル画像からテキストを抽出**
+   - Vision対応のLM Studioモデルを使用してサムネイル内のテキストを自動抽出
+   - 抽出されたテキストは要約生成時に活用
 
 3. **mp3ファイルを whisper で文字起こし**
    - OpenAI Whisper Large V3 Turboモデルを使用
    - GPU環境に応じて自動でデバイスを選択（MPS/CPU）
+   - 読点で改行して見やすくフォーマット
 
 4. **文字起こしの内容を要約しマークダウンファイルにする**
    - LM StudioのAPIを使用して要約を生成
    - 動画情報（タイトル、アップローダー、再生回数など）を含むマークダウン形式で出力
+   - タイトルとサムネイルのテキストを考慮した拡張要約機能
+
+5. **結果を整理して保存**
+   - 動画タイトルに基づいて安全なディレクトリ名を生成
+   - `summarized` ディレクトリに結果を保存
 
 ## セットアップ手順
 
@@ -42,6 +55,7 @@ uv pip install -r requirements.txt
 1. [LM Studio](https://lmstudio.ai/)をダウンロード・インストール
 2. LM Studioを起動し、以下のモデルをダウンロード：
    - **要約用モデル**: `openai/gpt-oss-120b` または同等の性能を持つモデル
+   - **Vision用モデル**: `google/gemma-3-27b` またはVision対応のモデル（サムネイルテキスト抽出用）
 3. LM Studioでモデルを読み込み、ローカルAPIサーバーを起動（デフォルト: http://localhost:1234）
 
 #### GPU環境に応じたモデル設定
@@ -93,11 +107,13 @@ python summarize.py
 
 ## 出力ファイル
 
-実行後、`output` ディレクトリ（動画タイトルにリネームされる）に以下が生成されます：
+実行後、`summarized` ディレクトリ内に動画タイトル名のディレクトリが作成され、以下が生成されます：
 
 - `transcription.txt`: 文字起こし結果
 - `summary.md`: 要約結果（マークダウン形式）
-- `audio.mp3`: 変換された音声ファイル
+- `audio.mp3`: ダウンロードされた音声ファイル
+- `thumbnail.png`: ダウンロードされたサムネイル画像
+- `thumbnail.txt`: サムネイルから抽出されたテキスト（テキストが検出された場合のみ）
 
 ## 設定項目
 
@@ -106,16 +122,18 @@ python summarize.py
 - `YOUTUBE_URL`: YouTube動画のURL
 - `OUTPUT_DIR`: 出力ディレクトリ（デフォルト: "./output"）
 - `STT_DEVICE`: Whisperの実行デバイス（"mps"/"cpu"）
-- `STT_MODEL_ID`: WhisperモデルID
-- `LM_STUDIO_API_URL`: LM Studio API URL
-- `LM_STUDIO_MODEL`: 使用する要約モデル名
+- `STT_MODEL_ID`: WhisperモデルID（デフォルト: "openai/whisper-large-v3-turbo"）
+- `LM_STUDIO_API_URL`: LM Studio API URL（デフォルト: "http://localhost:1234/v1/chat/completions"）
+- `LM_STUDIO_SUMMARY_MODEL`: 要約用モデル名（デフォルト: "openai/gpt-oss-120b"）
+- `LM_STUDIO_VISION_MODEL`: Vision用モデル名（デフォルト: "google/gemma-3-27b"）
 
 ## トラブルシューティング
 
 ### LM Studioに接続できない場合
 - LM Studioが起動しているか確認
 - API URL（デフォルト: http://localhost:1234）が正しいか確認
-- モデルが読み込まれているか確認
+- 要約用モデルとVision用モデルの両方が読み込まれているか確認
+- Vision機能を使用する場合は、Vision対応のモデルが選択されているか確認
 
 ### ffmpegが見つからない場合
 - ffmpegがインストールされているか確認
@@ -124,6 +142,17 @@ python summarize.py
 ### GPU使用時の問題
 - CUDA/MPSが正しくインストールされているか確認
 - PyTorchがGPU対応版か確認
+
+### サムネイルテキスト抽出が動作しない場合
+- Vision対応のモデルが正しく読み込まれているか確認
+- サムネイル画像が正常にダウンロードされているか確認
+- Vision APIのタイムアウト設定を確認（デフォルト: 120秒）
+
+### ダウンロードに失敗する場合
+yt-dlpライブラリのバージョンアップを試してください
+```bash
+pip install --upgrade yt-dlp
+```
 
 ## 必要な依存関係
 
@@ -134,3 +163,4 @@ python summarize.py
 - yt_dlp
 
 詳細は `requirements.txt` を参照してください。
+
